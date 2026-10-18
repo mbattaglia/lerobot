@@ -13,9 +13,28 @@ It changes defaults so that nothing reaches the Hugging Face Hub unless you ask.
 | Dataset and policy visibility | Hub default (public for personal accounts) | Private |
 | `LeRobotDataset.push_to_hub`, `push_model_to_hub`, checkpoint pushes | Hub default | Private unless `private=False` |
 | Upload while offline | Fails after the run | Fails at startup with the fix in the message |
+| Async inference and RL actor/learner messages | `pickle`: a peer can run code on the receiver | JSON plus safetensors (`lerobot/utils/safe_serialization.py`): only listed LeRobot types are rebuilt |
 
 Cloud training through `--job.target` still pushes, because the result only exists on the Hub.
 That path needs `HF_HUB_OFFLINE=0`.
+
+## Async inference
+
+`policy_server` and `robot_client` run on machines you choose, not on Hugging Face servers.
+Upstream they unpickle each other's messages, so either side could run code on the other.
+This fork sends JSON plus safetensors instead. The receiver rebuilds only these types:
+`RemotePolicyConfig`, `TimedObservation`, `TimedAction`, `PolicyFeature`, and `FeatureType`.
+
+Both sides must run this fork. An upstream client or server fails with
+"Not a LeRobot safe-serialization message".
+
+The gRPC channel is still unencrypted and unauthenticated.
+A server you connect to still chooses the arm's actions.
+To use a remote GPU, bind the server to `127.0.0.1` and reach it through an SSH tunnel:
+
+```bash
+ssh -N -L 8080:127.0.0.1:8080 user@gpu-host
+```
 
 ## Install for the SO-101
 
