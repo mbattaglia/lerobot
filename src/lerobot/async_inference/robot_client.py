@@ -34,7 +34,6 @@ python src/lerobot/async_inference/robot_client.py \
 """
 
 import logging
-import pickle  # nosec
 import threading
 import time
 from collections.abc import Callable
@@ -64,9 +63,11 @@ from lerobot.transport import (
 )
 from lerobot.transport.utils import grpc_channel_options, send_bytes_in_chunks
 from lerobot.utils.import_utils import register_third_party_plugins
+from lerobot.utils.safe_serialization import dumps, loads
 
 from .configs import RobotClientConfig
 from .helpers import (
+    ASYNC_MESSAGE_TYPES,
     Action,
     FPSTracker,
     Observation,
@@ -150,7 +151,7 @@ class RobotClient:
             self.logger.debug(f"Connected to policy server in {end_time - start_time:.4f}s")
 
             # send policy instructions
-            policy_config_bytes = pickle.dumps(self.policy_config)
+            policy_config_bytes = dumps(self.policy_config)
             policy_setup = services_pb2.PolicySetup(data=policy_config_bytes)
 
             self.logger.info("Sending policy instructions to policy server")
@@ -193,7 +194,7 @@ class RobotClient:
             raise ValueError("Input observation needs to be a TimedObservation!")
 
         start_time = time.perf_counter()
-        observation_bytes = pickle.dumps(obs)
+        observation_bytes = dumps(obs)
         serialize_time = time.perf_counter() - start_time
         self.logger.debug(f"Observation serialization time: {serialize_time:.6f}s")
 
@@ -283,7 +284,7 @@ class RobotClient:
 
                 # Deserialize bytes back into list[TimedAction]
                 deserialize_start = time.perf_counter()
-                timed_actions = pickle.loads(actions_chunk.data)  # nosec
+                timed_actions = loads(actions_chunk.data, allowed=ASYNC_MESSAGE_TYPES)
                 deserialize_time = time.perf_counter() - deserialize_start
 
                 # Log device type of received actions

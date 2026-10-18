@@ -18,13 +18,13 @@
 import io
 import json
 import logging
-import pickle  # nosec B403: Safe usage for internal serialization only
 from multiprocessing.synchronize import Event as MpEvent
 from queue import Queue
 from typing import Any
 
 import torch
 
+from lerobot.utils import safe_serialization
 from lerobot.utils.transition import Transition
 
 from . import services_pb2
@@ -127,15 +127,12 @@ def bytes_to_state_dict(buffer: bytes) -> dict[str, torch.Tensor]:
 
 
 def python_object_to_bytes(python_object: Any) -> bytes:
-    return pickle.dumps(python_object)
+    return safe_serialization.dumps(python_object)
 
 
 def bytes_to_python_object(buffer: bytes) -> Any:
-    bytes_buffer = io.BytesIO(buffer)
-    bytes_buffer.seek(0)
-    obj = pickle.load(bytes_buffer)  # nosec B301: Safe usage of pickle.load
-    # Add validation checks here
-    return obj
+    # Never pickle: the learner reads these bytes from the network.
+    return safe_serialization.loads(buffer)
 
 
 def bytes_to_transitions(buffer: bytes) -> list[Transition]:

@@ -13,7 +13,6 @@
 # limitations under the License.
 
 import math
-import pickle
 import time
 
 import pytest
@@ -24,6 +23,7 @@ import numpy as np  # noqa: E402
 import torch  # noqa: E402
 
 from lerobot.async_inference.helpers import (  # noqa: E402
+    ASYNC_MESSAGE_TYPES,
     FPSTracker,
     TimedAction,
     TimedObservation,
@@ -35,6 +35,7 @@ from lerobot.async_inference.helpers import (  # noqa: E402
 )
 from lerobot.configs.types import FeatureType, PolicyFeature
 from lerobot.utils.constants import OBS_IMAGES, OBS_STATE
+from lerobot.utils.safe_serialization import dumps, loads
 
 # ---------------------------------------------------------------------
 # FPSTracker
@@ -129,9 +130,9 @@ def test_timed_observation_getters():
 
 
 def test_timed_data_deserialization_data_getters():
-    """TimedAction / TimedObservation survive a round-trip through ``pickle``.
+    """TimedAction / TimedObservation survive a round-trip through the wire format.
 
-    The async-inference stack uses ``pickle.dumps`` to move these objects across
+    The async-inference stack uses ``safe_serialization.dumps`` to move these objects across
     the gRPC boundary (see RobotClient.send_observation and PolicyServer.StreamActions).
     This test ensures that the payload keeps its content intact after
     the (de)serialization round-trip.
@@ -145,8 +146,8 @@ def test_timed_data_deserialization_data_getters():
     ta_in = TimedAction(timestamp=ts, action=original_action, timestep=13)
 
     # Serialize → bytes → deserialize
-    ta_bytes = pickle.dumps(ta_in)  # nosec
-    ta_out: TimedAction = pickle.loads(ta_bytes)  # nosec B301
+    ta_bytes = dumps(ta_in)
+    ta_out: TimedAction = loads(ta_bytes, allowed=ASYNC_MESSAGE_TYPES)
 
     # Identity & content checks
     assert math.isclose(ta_out.get_timestamp(), ts, rel_tol=0, abs_tol=1e-6)
@@ -159,8 +160,8 @@ def test_timed_data_deserialization_data_getters():
     obs_dict = {OBS_STATE: torch.arange(4).float()}
     to_in = TimedObservation(timestamp=ts, observation=obs_dict, timestep=7, must_go=True)
 
-    to_bytes = pickle.dumps(to_in)  # nosec
-    to_out: TimedObservation = pickle.loads(to_bytes)  # nosec B301
+    to_bytes = dumps(to_in)
+    to_out: TimedObservation = loads(to_bytes, allowed=ASYNC_MESSAGE_TYPES)
 
     assert math.isclose(to_out.get_timestamp(), ts, rel_tol=0, abs_tol=1e-6)
     assert to_out.get_timestep() == 7

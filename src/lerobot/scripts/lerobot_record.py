@@ -153,6 +153,7 @@ from lerobot.teleoperators import (  # noqa: F401
 from lerobot.teleoperators.keyboard import KeyboardTeleop
 from lerobot.utils.constants import ACTION, OBS_STR
 from lerobot.utils.feature_utils import build_dataset_frame, combine_feature_dicts
+from lerobot.utils.hub import require_hub_online
 from lerobot.utils.import_utils import register_third_party_plugins
 from lerobot.utils.keyboard_input import init_keyboard_listener
 from lerobot.utils.robot_utils import precise_sleep
@@ -196,6 +197,8 @@ class RecordConfig:
                 "Use --teleop.type=... to specify one. "
                 "For policy-based deployment, use lerobot-rollout instead."
             )
+        if self.dataset.push_to_hub:
+            require_hub_online("--dataset.push_to_hub=true")
 
 
 """ --------------- record_loop() data flow --------------------------

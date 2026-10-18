@@ -17,12 +17,25 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import Any, TypeVar
 
-from huggingface_hub import HfApi
+from huggingface_hub import HfApi, constants
 from huggingface_hub.utils import validate_hf_hub_args
 
 from .constants import CHECKPOINTS_DIR
 
 T = TypeVar("T", bound="HubMixin")
+
+
+def require_hub_online(action: str) -> None:
+    """Raise before `action` starts if Hub access is disabled.
+
+    LeRobot keeps the Hub offline by default (see ``lerobot/__init__.py``), so a run that
+    ends in an upload would otherwise fail only after the work is done.
+    """
+    if constants.is_offline_mode():
+        raise ValueError(
+            f"{action} needs the Hugging Face Hub, but HF_HUB_OFFLINE is enabled (the default). "
+            "Rerun with HF_HUB_OFFLINE=0 to allow it."
+        )
 
 
 def find_latest_hub_checkpoint(
@@ -156,7 +169,7 @@ class HubMixin:
         repo_id: str,
         *,
         commit_message: str | None = None,
-        private: bool | None = None,
+        private: bool | None = True,
         token: str | None = None,
         branch: str | None = None,
         create_pr: bool | None = None,

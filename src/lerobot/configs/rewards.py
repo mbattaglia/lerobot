@@ -65,7 +65,7 @@ class RewardModelConfig(draccus.ChoiceRegistry, HubMixin, abc.ABC):
     # Hub metadata
     license: str | None = None
     tags: list[str] | None = None
-    private: bool | None = None
+    private: bool | None = True
 
     def __post_init__(self) -> None:
         if not self.device or not is_torch_device_available(self.device):

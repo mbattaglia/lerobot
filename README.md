@@ -1,3 +1,6 @@
+> **Hardened fork of LeRobot `v0.6.1`.** The Hub stays offline and uploads stay off and private by default.
+> See [HARDENING.md](HARDENING.md) before installing.
+
 <p align="center">
   <img alt="LeRobot, Hugging Face Robotics Library" src="./media/readme/lerobot-logo-thumbnail.png" width="100%">
 </p>

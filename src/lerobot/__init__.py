@@ -31,7 +31,16 @@ are gated behind optional extras::
     pip install 'lerobot[all]'           # everything
 """
 
-from lerobot.__version__ import __version__
+import os
+
+# Keep the Hugging Face Hub offline unless the caller opts in. huggingface_hub reads this
+# variable once, at import, so it is set here before any submodule can import it.
+# Run a command with HF_HUB_OFFLINE=0 to allow downloads and uploads for that command.
+os.environ.setdefault("HF_HUB_OFFLINE", "1")
+# No usage telemetry from Hugging Face libraries, also when the Hub is enabled.
+os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")
+
+from lerobot.__version__ import __version__  # noqa: E402
 
 # Maps optional extras to the CLI entry-points they unlock.
 available_extras: dict[str, list[str]] = {
