@@ -28,7 +28,7 @@ from huggingface_hub.errors import HfHubHTTPError
 from lerobot import envs
 from lerobot.optim import LRSchedulerConfig, OptimizerConfig
 from lerobot.utils.constants import PRETRAINED_MODEL_DIR
-from lerobot.utils.hub import HubMixin, find_latest_hub_checkpoint
+from lerobot.utils.hub import HubMixin, find_latest_hub_checkpoint, require_hub_online
 from lerobot.utils.sample_weighting import SampleWeightingConfig
 
 from . import parser
@@ -287,6 +287,9 @@ class TrainPipelineConfig(HubMixin):
             and not self.job.is_remote
         ):
             raise ValueError("'repo_id' argument missing. Please specify it to push the model to the hub.")
+
+        if hasattr(active_cfg, "push_to_hub") and active_cfg.push_to_hub and not self.job.is_remote:
+            require_hub_online("--policy.push_to_hub=true")
 
         if self.save_checkpoint_to_hub and not (self.policy is not None and self.policy.repo_id):
             raise ValueError("save_checkpoint_to_hub requires --policy.repo_id.")

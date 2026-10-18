@@ -67,11 +67,11 @@ class PreTrainedConfig(draccus.ChoiceRegistry, HubMixin, abc.ABC):  # type: igno
     # Whether the policy employed PEFT for training.
     use_peft: bool = False
 
-    push_to_hub: bool = True  # type: ignore[assignment] # TODO: use a different name to avoid override
+    push_to_hub: bool = False  # type: ignore[assignment] # TODO: use a different name to avoid override
     repo_id: str | None = None
 
     # Upload on private repository on the Hugging Face hub.
-    private: bool | None = None
+    private: bool | None = True
     # Add tags to your policy on the hub.
     tags: list[str] | None = None
     # Add tags to your policy on the hub.

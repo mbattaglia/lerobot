@@ -302,7 +302,7 @@ def push_checkpoint_to_hub(
     checkpoint_dir: Path,
     repo_id: str,
     *,
-    private: bool | None = None,
+    private: bool | None = True,
 ) -> None:
     """Upload a saved checkpoint directory to the Hub under checkpoints/<name>/.
 

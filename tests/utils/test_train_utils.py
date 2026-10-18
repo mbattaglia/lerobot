@@ -195,14 +195,14 @@ def test_push_checkpoint_to_hub_creates_repo_and_uploads(tmp_path, monkeypatch):
     assert tag_kwargs["exist_ok"] is True
 
 
-def test_push_checkpoint_to_hub_defaults_to_hub_default_visibility(tmp_path, monkeypatch):
+def test_push_checkpoint_to_hub_defaults_to_private(tmp_path, monkeypatch):
     ckpt = tmp_path / "010000"
     (ckpt / "pretrained_model").mkdir(parents=True)
     api = MagicMock()
     monkeypatch.setattr("lerobot.common.train_utils.HfApi", lambda *a, **k: api)
     push_checkpoint_to_hub(ckpt, "user/run")
     api.create_repo.assert_called_once()
-    assert api.create_repo.call_args.kwargs["private"] is None
+    assert api.create_repo.call_args.kwargs["private"] is True
 
 
 def test_resolve_resume_checkpoint_downloads_latest_and_links(tmp_path, monkeypatch):

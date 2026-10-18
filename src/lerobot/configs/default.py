@@ -105,7 +105,7 @@ class EvalConfig:
     # suffixed by task and env index). Requires recording=true.
     recording_repo_id: str | None = None
     # Whether the pushed recording repositories should be private.
-    recording_private: bool = False
+    recording_private: bool = True
 
     def __post_init__(self) -> None:
         if self.recording_repo_id is not None and not self.recording:

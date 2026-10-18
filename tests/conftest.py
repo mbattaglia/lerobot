@@ -15,7 +15,11 @@
 # limitations under the License.
 
 import functools
+import os
 import traceback
+
+# The library keeps the Hub offline by default; the suite downloads fixtures from it.
+os.environ.setdefault("HF_HUB_OFFLINE", "0")
 
 import draccus.wrappers.docstring as _draccus_docstring
 import pytest
