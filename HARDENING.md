@@ -14,6 +14,7 @@ It changes defaults so that nothing reaches the Hugging Face Hub unless you ask.
 | `LeRobotDataset.push_to_hub`, `push_model_to_hub`, checkpoint pushes | Hub default | Private unless `private=False` |
 | Upload while offline | Fails after the run | Fails at startup with the fix in the message |
 | Async inference and RL actor/learner messages | `pickle`: a peer can run code on the receiver | JSON plus safetensors (`lerobot/utils/safe_serialization.py`): only listed LeRobot types are rebuilt |
+| Live camera and joint view | `rerun` or `foxglove` (`viz` extra; Rerun's usage analytics are on by default) | Also `--display_mode=web`: a local, read-only browser view with no extra packages |
 
 Cloud training through `--job.target` still pushes, because the result only exists on the Hub.
 That path needs `HF_HUB_OFFLINE=0`.
@@ -35,6 +36,18 @@ To use a remote GPU, bind the server to `127.0.0.1` and reach it through an SSH 
 ```bash
 ssh -N -L 8080:127.0.0.1:8080 user@gpu-host
 ```
+
+## Live view without extra packages
+
+`--display_data=true --display_mode=web` serves camera feeds and joint values at `http://127.0.0.1:9876`.
+It works with `lerobot-teleoperate`, `lerobot-record`, and `lerobot-rollout`.
+Use `--display_port` to choose another port.
+
+- It uses the standard library HTTP server and OpenCV, which LeRobot already installs.
+- It binds to loopback only, and refuses `--display_ip` values that are not loopback addresses.
+- It answers only requests whose `Host` is `localhost`, `127.0.0.1`, or `[::1]`, which blocks DNS rebinding.
+- It serves only `GET`. It sends no CORS headers, sets a strict Content-Security-Policy, and loads nothing from other sites.
+- The control loop only stores the latest values. JPEG encoding runs in the server threads, at most 15 frames per second per camera.
 
 ## Install for the SO-101
 

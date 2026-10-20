@@ -16,18 +16,20 @@
 
 Selects a visualization backend at runtime via a display-mode string (e.g. a ``--display_mode`` CLI
 flag) so callers never branch on the backend. The concrete implementations live in
-:mod:`lerobot.utils.rerun_visualization` and :mod:`lerobot.utils.foxglove_visualization`; importing
-this module does not import ``rerun`` or ``foxglove`` (each backend imports its SDK lazily behind a
-``require_package`` guard).
+:mod:`lerobot.utils.rerun_visualization`, :mod:`lerobot.utils.foxglove_visualization` and
+:mod:`lerobot.utils.web_visualization`; importing this module does not import ``rerun`` or ``foxglove``
+(each backend imports its SDK lazily behind a ``require_package`` guard). The ``web`` backend needs no
+extra package.
 """
 
 from lerobot.lerobot_types import RobotAction, RobotObservation
 
 from .foxglove_visualization import init_foxglove, log_foxglove_data, shutdown_foxglove
 from .rerun_visualization import init_rerun, log_rerun_data, shutdown_rerun
+from .web_visualization import init_web, log_web_data, shutdown_web
 
 # Visualization backends selectable at runtime via a display-mode string (e.g. a --display_mode flag).
-VISUALIZATION_MODES = ("rerun", "foxglove")
+VISUALIZATION_MODES = ("rerun", "foxglove", "web")
 
 
 def init_visualization(
@@ -41,13 +43,16 @@ def init_visualization(
 
     For ``"rerun"``, ``ip``/``port`` point at an optional remote Rerun server. For ``"foxglove"``,
     ``ip`` is the interface to bind the WebSocket server to (``127.0.0.1`` for local only, ``0.0.0.0``
-    for all interfaces) and ``port`` is its port.
+    for all interfaces) and ``port`` is its port. For ``"web"``, ``ip`` must be a loopback address
+    (default ``127.0.0.1``) and ``port`` defaults to 9876.
     """
 
     if display_mode == "rerun":
         init_rerun(session_name=session_name, ip=ip, port=port)
     elif display_mode == "foxglove":
         init_foxglove(host=ip or "127.0.0.1", port=port)
+    elif display_mode == "web":
+        init_web(host=ip or "127.0.0.1", port=port)
     else:
         raise ValueError(f"Unknown display_mode '{display_mode}'. Expected one of {VISUALIZATION_MODES}.")
 
@@ -64,6 +69,8 @@ def log_visualization_data(
         log_rerun_data(observation=observation, action=action, compress_images=compress_images)
     elif display_mode == "foxglove":
         log_foxglove_data(observation=observation, action=action, compress_images=compress_images)
+    elif display_mode == "web":
+        log_web_data(observation=observation, action=action, compress_images=compress_images)
     else:
         raise ValueError(f"Unknown display_mode '{display_mode}'. Expected one of {VISUALIZATION_MODES}.")
 
@@ -75,5 +82,7 @@ def shutdown_visualization(display_mode: str) -> None:
         shutdown_rerun()
     elif display_mode == "foxglove":
         shutdown_foxglove()
+    elif display_mode == "web":
+        shutdown_web()
     else:
         raise ValueError(f"Unknown display_mode '{display_mode}'. Expected one of {VISUALIZATION_MODES}.")
