@@ -27,7 +27,7 @@ from lerobot.utils import visualization_utils as vu
 
 
 def test_visualization_modes():
-    assert vu.VISUALIZATION_MODES == ("rerun", "foxglove")
+    assert vu.VISUALIZATION_MODES == ("rerun", "foxglove", "web")
 
 
 @pytest.mark.parametrize("func", ["init_visualization", "log_visualization_data", "shutdown_visualization"])

@@ -243,7 +243,7 @@ class RolloutConfig:
     device: str | None = None
     task: str = ""
     display_data: bool = False
-    # Visualization backend used when display_data is True: "rerun" or "foxglove".
+    # Visualization backend used when display_data is True: "rerun", "foxglove" or "web" (local browser view, no extra packages).
     display_mode: str = "rerun"
     # For "rerun": IP of a remote server to send to. For "foxglove": interface to bind the WebSocket
     # server to (127.0.0.1 for local only, 0.0.0.0 for all interfaces).
