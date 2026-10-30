@@ -70,3 +70,20 @@ lerobot-train \
     --accelerator.grad_scaler.init_scale=1024 \
     --accelerator.grad_scaler.growth_interval=2000 ...
 ```
+
+## torch.compile
+
+`lerobot-train` can compile the policy with `torch.compile`. It is off by default; turn it on with `--use_torch_compile=true`:
+
+```bash
+lerobot-train \
+    --policy.type=act \
+    --policy.device=cuda \
+    --use_torch_compile=true ...
+```
+
+- `--torch_compile_backend` (default `inductor`) and `--torch_compile_mode` (default `default`, also `reduce-overhead` or `max-autotune`) are passed to `torch.compile`. These are the same flag names as in `lerobot-rollout`.
+- The first training steps are slow while the model compiles, so a speedup only shows after the warm-up. Whether you gain anything depends on the policy, the GPU and the batch size: compare `updt_s` in the logs with and without the flag before you keep it on.
+- The model is compiled in place (`nn.Module.compile`), so checkpoints are the same as without compile. A checkpoint trained with compile loads in `lerobot-rollout` and `lerobot-eval` as usual, and you can resume a run with the flag on or off.
+- If `torch.compile` is not available or compilation fails (for example, no Triton or C compiler is installed), training logs a warning and continues without compile.
+- It is not applied to sharded (FSDP2) training yet.

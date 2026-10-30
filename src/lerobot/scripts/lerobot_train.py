@@ -32,8 +32,9 @@ import dataclasses
 import logging
 import sys
 import time
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import AbstractContextManager, contextmanager, nullcontext
+from functools import partial
 from pprint import pformat
 from typing import TYPE_CHECKING, Any
 
@@ -134,6 +135,56 @@ def _ema_weights(ema: Any, policy: PreTrainedPolicy) -> Iterator[None]:
         yield
     finally:
         ema.restore(params)
+
+
+def _compile_policy_in_place(policy: torch.nn.Module, *, backend: str, mode: str) -> bool:
+    """Compile `policy` in place with `nn.Module.compile` and report whether it was configured.
+
+    In-place compilation only routes `policy(...)` through a compiled `__call__`; the module tree
+    is unchanged, so state_dict keys carry no `_orig_mod.` prefix and checkpoints load the same
+    with or without compile. ``torch.compile`` compiles lazily on the first invocation, so success
+    here does not guarantee that backend compilation will succeed during the first step (see
+    `_first_update_with_compile_fallback`).
+    """
+    if not hasattr(torch, "compile") or not hasattr(policy, "compile"):
+        logging.warning("torch.compile is not available in this PyTorch build; training without it")
+        return False
+
+    try:
+        policy.compile(backend=backend, mode=mode)
+    except Exception as exc:
+        logging.warning("Failed to configure torch.compile, training without it: %s", exc)
+        return False
+
+    logging.info(f"torch.compile configured for the policy ({backend=}, {mode=})")
+    return True
+
+
+def _disable_torch_compile(policy: torch.nn.Module) -> None:
+    """Undo `nn.Module.compile`: `__call__` goes back to the eager forward."""
+    policy._compiled_call_impl = None
+
+
+def _first_update_with_compile_fallback(
+    update: Callable[[], tuple[MetricsTracker, dict | None]],
+    policy: torch.nn.Module,
+    optimizer: Optimizer,
+) -> tuple[MetricsTracker, dict | None]:
+    """Run the first update of a compiled policy, retrying it eagerly if compilation fails.
+
+    The graphs are built during this first forward and backward pass, so this is where a missing
+    Triton or C compiler, or an unsupported op, surfaces. Nothing is applied before the backward
+    pass completes, so the retry only has to clear any partial gradients. Under gradient
+    accumulation accelerate counts the failed attempt as a micro-batch, so after a fallback the
+    first optimizer update sums one micro-batch fewer.
+    """
+    try:
+        return update()
+    except Exception as exc:
+        logging.warning("torch.compile failed during the first training step, training without it: %s", exc)
+        _disable_torch_compile(policy)
+        optimizer.zero_grad()
+        return update()
 
 
 @contextmanager
@@ -767,6 +818,25 @@ def train(cfg: TrainPipelineConfig) -> None:
     if cfg.resume:
         resume_after_prepare(cfg, accelerator, policy, optimizer, lr_scheduler)
 
+    # --- optional torch.compile -----------------------------------------------------------------
+    # Applied last, to the prepared model: the same point where accelerate puts its own compile.
+    # By then the weights are on the device and resumed, the AMP autocast is patched into
+    # `forward` (so it is traced into the graph), and a DDP wrapper is compiled as a whole, which
+    # is torch's recommended order. The GradScaler acts on the loss and optimizer, outside the
+    # compiled region. The compile is in place, so unwrap_model() and checkpoints are unchanged.
+    first_step_compiles = False
+    if cfg.use_torch_compile:
+        if parallel_dims.is_sharded:
+            logging.warning(
+                "--use_torch_compile is not supported with sharded training (FSDP2) yet; training without it"
+            )
+        else:
+            first_step_compiles = _compile_policy_in_place(
+                policy, backend=cfg.torch_compile_backend, mode=cfg.torch_compile_mode
+            )
+            if first_step_compiles and is_main_process():
+                logging.info("The first training steps are slow while the model compiles")
+
     # --- auxiliaries (after the core assembly, per the construction-order contract) -------------
     sample_weighter = None
     if cfg.sample_weighting is not None:
@@ -932,7 +1002,8 @@ def train(cfg: TrainPipelineConfig) -> None:
         batch = _preprocess_dataset_batch(batch, dataset.meta.camera_keys, cfg.rename_map, preprocessor)
         train_tracker.preprocessing_s = time.perf_counter() - preprocessing_start
 
-        train_tracker, _ = update_policy(
+        run_update = partial(
+            update_policy,
             train_tracker,
             policy,
             batch,
@@ -942,6 +1013,12 @@ def train(cfg: TrainPipelineConfig) -> None:
             lr_scheduler=lr_scheduler,
             sample_weighter=sample_weighter,
         )
+        if first_step_compiles:
+            # Compilation happens during the first update; fall back to eager if it fails there.
+            train_tracker, _ = _first_update_with_compile_fallback(run_update, policy, optimizer)
+            first_step_compiles = False
+        else:
+            train_tracker, _ = run_update()
         train_tracker.step_s = time.perf_counter() - step_start
 
         # Pull one optimizer step of the live weights into the EMA shadow (main process only).

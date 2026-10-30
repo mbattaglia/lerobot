@@ -128,6 +128,13 @@ class TrainPipelineConfig(HubMixin):
     # Set to True to use deterministic cuDNN algorithms for reproducibility.
     # This disables cudnn.benchmark and may reduce training speed by ~10-20 percent.
     cudnn_deterministic: bool = False
+    # Compile the policy with torch.compile before training (in place, via `nn.Module.compile`, so
+    # checkpoints keep their usual state_dict keys). The first steps are slow while the model
+    # compiles; measure the gain on your setup. If compile is unavailable or fails, training logs a
+    # warning and continues without it. Same flag names as `lerobot-rollout`.
+    use_torch_compile: bool = False
+    torch_compile_backend: str = "inductor"
+    torch_compile_mode: str = "default"
     # Number of workers for the dataloader.
     num_workers: int = 4
     batch_size: int = 8
