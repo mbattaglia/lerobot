@@ -100,10 +100,11 @@ def build_remote_config_file(cfg, repo_id: str, dest: Path, tags: list[str] | No
     The pod runs `lerobot-train --config_path=<dest>` and downloads the dataset
     by repo_id into its own cache. Client-only fields are stripped so the config
     is accepted by the trainer image: `job` (pure client orchestration) is always
-    removed, and `save_checkpoint_to_hub` is removed unless explicitly enabled —
-    older lerobot images reject unknown keys, so the default keeps the config
-    compatible with the released `lerobot-gpu` image. `tags` are merged into
-    policy.tags so the trained model the pod pushes carries them too.
+    removed, and `save_checkpoint_to_hub` and the `torch_compile` fields are removed
+    unless explicitly enabled — older lerobot images reject unknown keys, so the
+    default keeps the config compatible with the released `lerobot-gpu` image.
+    `tags` are merged into policy.tags so the trained model the pod pushes carries
+    them too.
     """
     remote = copy.deepcopy(cfg)
     remote.policy.push_to_hub = True
@@ -131,6 +132,9 @@ def build_remote_config_file(cfg, repo_id: str, dest: Path, tags: list[str] | No
         policy.pop("dtype", None)
     if not remote.save_checkpoint_to_hub:
         data.pop("save_checkpoint_to_hub", None)
+    if not remote.use_torch_compile:
+        for key in ("use_torch_compile", "torch_compile_backend", "torch_compile_mode"):
+            data.pop(key, None)
 
     dest.parent.mkdir(parents=True, exist_ok=True)
     dest.write_text(json.dumps(data, indent=4))

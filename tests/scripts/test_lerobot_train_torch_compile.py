@@ -24,6 +24,7 @@ import json
 import logging
 
 import draccus
+import numpy as np
 import pytest
 import torch
 from safetensors.torch import load_file
@@ -35,13 +36,17 @@ pytest.importorskip("datasets", reason="datasets is required (install lerobot[da
 from lerobot.configs.default import DatasetConfig  # noqa: E402
 from lerobot.configs.train import TRAIN_CONFIG_NAME, TrainPipelineConfig  # noqa: E402
 from lerobot.configs.types import FeatureType, PolicyFeature  # noqa: E402
+from lerobot.datasets.lerobot_dataset import LeRobotDataset  # noqa: E402
 from lerobot.policies.act.configuration_act import ACTConfig  # noqa: E402
 from lerobot.policies.act.modeling_act import ACTPolicy  # noqa: E402
+from lerobot.scripts import lerobot_train  # noqa: E402
 from lerobot.scripts.lerobot_train import (  # noqa: E402
     _compile_policy_in_place,
     _first_update_with_compile_fallback,
+    update_policy,
 )
-from lerobot.utils.constants import ACTION, OBS_STATE  # noqa: E402
+from lerobot.utils.constants import ACTION, OBS_STATE, PRETRAINED_MODEL_DIR  # noqa: E402
+from lerobot.utils.logging_utils import AverageMeter, MetricsTracker  # noqa: E402
 
 TEST_BACKEND = "aot_eager"
 IMAGE_KEY = "observation.images.top"
@@ -199,20 +204,259 @@ def test_missing_torch_compile_warns(monkeypatch, caplog):
     assert "not available" in caplog.text
 
 
-def test_first_step_failure_falls_back_to_eager(caplog):
-    policy = torch.nn.Linear(2, 1)
-    optimizer = torch.optim.SGD(policy.parameters(), lr=0.1)
-    policy._compiled_call_impl = lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("boom"))
+def test_already_compiled_policy_is_not_compiled_again():
+    policy = torch.nn.Linear(2, 2)
+    policy.compile(backend="eager")
+    compiled_call = policy._compiled_call_impl
+    assert not _compile_policy_in_place(policy, backend="eager", mode="default")
+    assert policy._compiled_call_impl is compiled_call
+    assert not _compile_policy_in_place(torch.compile(torch.nn.Linear(2, 2)), backend="eager", mode="default")
+
+
+# --- first-step fallback, against a real (CPU) accelerate stack ------------------------------------
+
+
+class _FailInBackward(torch.autograd.Function):
+    """Identity forward; its backward fails like a lazily lowered backward graph would."""
+
+    @staticmethod
+    def forward(ctx, x):
+        return x.view_as(x)
+
+    @staticmethod
+    def backward(ctx, grad):
+        raise RuntimeError("backward lowering failed")
+
+
+class _TwoLayerPolicy(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        torch.manual_seed(0)
+        self.lin1 = torch.nn.Linear(3, 4)
+        self.lin2 = torch.nn.Linear(4, 1)
+
+    def forward(self, batch, fail_in_backward: bool = False):
+        hidden = self.lin1(batch["x"])
+        if fail_in_backward:
+            # lin2's backward runs first and leaves its gradients behind; lin1 never gets any.
+            hidden = _FailInBackward.apply(hidden)
+        loss = torch.nn.functional.mse_loss(self.lin2(hidden), batch["y"])
+        return loss, {}
+
+
+@pytest.fixture
+def make_accelerator():
+    from accelerate import Accelerator
+    from accelerate.state import AcceleratorState, GradientState
+
+    yield lambda steps: Accelerator(cpu=True, gradient_accumulation_steps=steps)
+    AcceleratorState._reset_state(reset_partial_state=True)
+    GradientState._reset_state()
+
+
+def _tracker() -> MetricsTracker:
+    metrics = {
+        "loss": AverageMeter("loss", ":.3f"),
+        "grad_norm": AverageMeter("grdn", ":.3f"),
+        "lr": AverageMeter("lr", ":0.1e"),
+        "update_s": AverageMeter("updt_s", ":.3f"),
+    }
+    return MetricsTracker(1, 1, 1, metrics, initial_step=0)
+
+
+def _batches(n: int) -> list[dict[str, torch.Tensor]]:
+    generator = torch.Generator().manual_seed(1)
+    return [
+        {"x": torch.randn(2, 3, generator=generator), "y": torch.randn(2, 1, generator=generator)}
+        for _ in range(n)
+    ]
+
+
+def test_first_step_backward_failure_under_gradient_accumulation_matches_eager(make_accelerator, caplog):
+    """A failed attempt must leave neither partial gradients nor a shifted accumulation counter."""
+    batches = _batches(4)
+
+    # Eager reference: two optimizer updates of two micro-batches each.
+    reference = _TwoLayerPolicy()
+    reference_optimizer = torch.optim.SGD(reference.parameters(), lr=0.5)
+    for pair in (batches[:2], batches[2:]):
+        for batch in pair:
+            (reference(batch)[0] / 2).backward()
+        reference_optimizer.step()
+        reference_optimizer.zero_grad()
+
+    accelerator = make_accelerator(2)
+    policy = _TwoLayerPolicy()
+    policy, optimizer = accelerator.prepare(policy, torch.optim.SGD(policy.parameters(), lr=0.5))
+    policy._compiled_call_impl = lambda batch: policy._call_impl(batch, fail_in_backward=True)
+    initial = {name: p.detach().clone() for name, p in policy.named_parameters()}
+
+    def update(batch):
+        return update_policy(_tracker(), policy, batch, optimizer, 0.0, accelerator=accelerator)
+
+    with caplog.at_level(logging.WARNING):
+        _first_update_with_compile_fallback(lambda: update(batches[0]), policy, optimizer, accelerator)
+    assert "RuntimeError: backward lowering failed" in caplog.text
+    assert policy._compiled_call_impl is None
+    # The first micro-batch must not sync: the update lands after the second, as in eager mode.
+    assert not accelerator.sync_gradients
+    for name, p in policy.named_parameters():
+        torch.testing.assert_close(p, initial[name])
+
+    for batch in batches[1:]:
+        update(batch)
+    for (name, p), q in zip(policy.named_parameters(), reference.parameters(), strict=True):
+        torch.testing.assert_close(p, q, msg=name)
+
+
+def test_error_after_the_optimizer_step_is_not_retried(make_accelerator):
+    accelerator = make_accelerator(1)
+    policy = _TwoLayerPolicy()
+    optimizer = accelerator.prepare(torch.optim.SGD(policy.parameters(), lr=0.5))
+    compiled_call = policy._call_impl
+    policy._compiled_call_impl = compiled_call
     calls = []
 
     def update():
-        calls.append(policy._compiled_call_impl is None)
-        loss = policy(torch.ones(1, 2)).sum()
-        loss.backward()
-        return "tracker", None
+        calls.append(1)
+        update_policy(_tracker(), policy, _batches(1)[0], optimizer, 0.0, accelerator=accelerator)
+        raise RuntimeError("after the step")
 
-    with caplog.at_level(logging.WARNING):
-        assert _first_update_with_compile_fallback(update, policy, optimizer) == ("tracker", None)
-    assert calls == [False, True]
-    assert policy._compiled_call_impl is None
-    assert "boom" in caplog.text
+    with pytest.raises(RuntimeError, match="after the step"):
+        _first_update_with_compile_fallback(update, policy, optimizer, accelerator)
+    assert calls == [1]
+    assert policy._compiled_call_impl is compiled_call
+
+
+def test_first_step_lowers_the_backward_graph_during_the_forward(make_accelerator):
+    """So a backend failure surfaces before DDP's reducer starts reducing gradient buckets."""
+    import torch._functorch.config as functorch_config
+
+    accelerator = make_accelerator(1)
+    policy = torch.nn.Linear(2, 2)
+    optimizer = accelerator.prepare(torch.optim.SGD(policy.parameters(), lr=0.1))
+    seen = []
+
+    def update():
+        seen.append(functorch_config.force_non_lazy_backward_lowering)
+        return _tracker(), None
+
+    _first_update_with_compile_fallback(update, policy, optimizer, accelerator)
+    assert seen == [True]
+    assert functorch_config.force_non_lazy_backward_lowering is False
+
+
+# --- end to end through train() --------------------------------------------------------------------
+
+DATASET_REPO_ID = "dummy/compile"
+FAILING_BACKEND = "lerobot_test_failing_backend"
+
+
+@torch._dynamo.register_backend(name=FAILING_BACKEND)
+def _failing_backend(gm, example_inputs):
+    raise RuntimeError("this backend always fails")
+
+
+def _make_dataset(tmp_path):
+    features = {
+        ACTION: {"dtype": "float32", "shape": (3,), "names": None},
+        OBS_STATE: {"dtype": "float32", "shape": (3,), "names": None},
+        IMAGE_KEY: {"dtype": "image", "shape": (32, 32, 3), "names": ["height", "width", "channel"]},
+    }
+    root = tmp_path / "_dataset"
+    dataset = LeRobotDataset.create(repo_id=DATASET_REPO_ID, fps=30, features=features, root=root)
+    rng = np.random.default_rng(0)
+    for _ in range(2):
+        for _ in range(10):
+            dataset.add_frame(
+                {
+                    ACTION: rng.standard_normal(3).astype(np.float32),
+                    OBS_STATE: rng.standard_normal(3).astype(np.float32),
+                    IMAGE_KEY: rng.integers(0, 255, size=(32, 32, 3), dtype=np.uint8),
+                    "task": "task",
+                }
+            )
+        dataset.save_episode()
+    dataset.finalize()
+    return root
+
+
+def _train(root, output_dir, **overrides) -> dict[str, torch.Tensor]:
+    from lerobot.policies.factory import make_policy_config
+
+    policy_config = make_policy_config(
+        "act",
+        device="cpu",
+        push_to_hub=False,
+        chunk_size=4,
+        n_action_steps=4,
+        dim_model=16,
+        n_heads=2,
+        dim_feedforward=32,
+        n_encoder_layers=1,
+        n_decoder_layers=1,
+        n_vae_encoder_layers=1,
+        latent_dim=4,
+        dropout=0.0,
+        pretrained_backbone_weights=None,
+    )
+    cfg = TrainPipelineConfig(
+        dataset=DatasetConfig(repo_id=DATASET_REPO_ID, root=str(root)),
+        policy=policy_config,
+        output_dir=output_dir,
+        steps=2,
+        batch_size=2,
+        num_workers=0,
+        seed=42,
+        log_freq=0,
+        env_eval_freq=0,
+        save_freq=2,
+        **overrides,
+    )
+    cfg.optimizer = policy_config.get_optimizer_preset()
+    cfg.scheduler = policy_config.get_scheduler_preset()
+    # The config is built in-process, so skip the CLI-oriented validation.
+    cfg.validate = lambda: None
+    lerobot_train.train(cfg)
+    return load_file(output_dir / "checkpoints" / "000002" / PRETRAINED_MODEL_DIR / "model.safetensors")
+
+
+@pytest.fixture
+def dataset_root(tmp_path):
+    pytest.importorskip("accelerate", reason="accelerate is required (install lerobot[training])")
+    return _make_dataset(tmp_path)
+
+
+@requires_torch_compile
+def test_train_with_compile_matches_eager(dataset_root, tmp_path, make_accelerator):
+    """aot_eager reproduces eager numerics exactly, so the two runs must save the same weights."""
+    eager = _train(dataset_root, tmp_path / "eager")
+    torch._dynamo.reset()
+    torch._dynamo.utils.counters.clear()
+    compiled = _train(
+        dataset_root, tmp_path / "compiled", use_torch_compile=True, torch_compile_backend=TEST_BACKEND
+    )
+    assert torch._dynamo.utils.counters["stats"]["unique_graphs"] > 0, "train() did not compile"
+    assert set(compiled) == set(eager)
+    for key, value in eager.items():
+        torch.testing.assert_close(compiled[key], value, msg=key)
+    torch._dynamo.reset()
+
+
+@requires_torch_compile
+def test_train_falls_back_to_eager_when_compile_fails(dataset_root, tmp_path, monkeypatch, make_accelerator):
+    disabled = []
+    monkeypatch.setattr(
+        lerobot_train,
+        "_disable_torch_compile",
+        lambda policy, _real=lerobot_train._disable_torch_compile: (disabled.append(policy), _real(policy)),
+    )
+    eager = _train(dataset_root, tmp_path / "eager")
+    torch._dynamo.reset()
+    fallback = _train(
+        dataset_root, tmp_path / "fallback", use_torch_compile=True, torch_compile_backend=FAILING_BACKEND
+    )
+    assert len(disabled) == 1
+    for key, value in eager.items():
+        torch.testing.assert_close(fallback[key], value, msg=key)
+    torch._dynamo.reset()

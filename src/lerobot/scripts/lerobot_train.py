@@ -111,7 +111,7 @@ else:
     PeftModel = None
 
 if TYPE_CHECKING or _accelerate_available:
-    from accelerate.utils import send_to_device
+    from accelerate.utils import is_compiled_module, send_to_device
 
 from .lerobot_eval import eval_policy_all
 
@@ -147,16 +147,25 @@ def _compile_policy_in_place(policy: torch.nn.Module, *, backend: str, mode: str
     `_first_update_with_compile_fallback`).
     """
     if not hasattr(torch, "compile") or not hasattr(policy, "compile"):
-        logging.warning("torch.compile is not available in this PyTorch build; training without it")
+        if is_main_process():
+            logging.warning("torch.compile is not available in this PyTorch build; training without it")
+        return False
+
+    if is_compiled_module(policy) or policy._compiled_call_impl is not None:
+        # e.g. accelerate's own dynamo plugin (ACCELERATE_DYNAMO_BACKEND) already compiled it.
+        if is_main_process():
+            logging.warning("The policy is already compiled; --use_torch_compile does not compile it again")
         return False
 
     try:
         policy.compile(backend=backend, mode=mode)
     except Exception as exc:
-        logging.warning("Failed to configure torch.compile, training without it: %s", exc)
+        if is_main_process():
+            logging.warning("Failed to configure torch.compile, training without it: %s", exc)
         return False
 
-    logging.info(f"torch.compile configured for the policy ({backend=}, {mode=})")
+    if is_main_process():
+        logging.info(f"torch.compile configured for the policy ({backend=}, {mode=})")
     return True
 
 
@@ -169,22 +178,48 @@ def _first_update_with_compile_fallback(
     update: Callable[[], tuple[MetricsTracker, dict | None]],
     policy: torch.nn.Module,
     optimizer: Optimizer,
+    accelerator: "Accelerator",
 ) -> tuple[MetricsTracker, dict | None]:
-    """Run the first update of a compiled policy, retrying it eagerly if compilation fails.
+    """Run the first update of a compiled policy, retrying it eagerly if it fails.
 
-    The graphs are built during this first forward and backward pass, so this is where a missing
-    Triton or C compiler, or an unsupported op, surfaces. Nothing is applied before the backward
-    pass completes, so the retry only has to clear any partial gradients. Under gradient
-    accumulation accelerate counts the failed attempt as a micro-batch, so after a fallback the
-    first optimizer update sums one micro-batch fewer.
+    The graphs are built during this first update, so this is where a missing Triton or C
+    compiler, or an unsupported op, surfaces. Retrying the same batch eagerly is safe because:
+
+    - The backward graphs are lowered during the forward (`force_non_lazy_backward_lowering`), so
+      a backend failure surfaces before DDP's reducer starts all-reducing gradient buckets.
+    - The retry only happens while the optimizer has not stepped. Up to that point a failed attempt
+      leaves at most partial gradients, cleared on the model itself (accelerate's `zero_grad()` is
+      a no-op on non-sync micro-batches), and one tick of accelerate's gradient-accumulation
+      counter, which is rolled back.
+
+    An error raised after the optimizer stepped is re-raised without a retry.
     """
+    stepped = False
+
+    def mark_stepped(*_: Any) -> None:
+        nonlocal stepped
+        stepped = True
+
+    handle = getattr(optimizer, "optimizer", optimizer).register_step_pre_hook(mark_stepped)
+    accumulation_step = accelerator.step
     try:
-        return update()
+        with torch._functorch.config.patch(force_non_lazy_backward_lowering=True):
+            return update()
     except Exception as exc:
-        logging.warning("torch.compile failed during the first training step, training without it: %s", exc)
+        if stepped:
+            raise
+        logging.warning(
+            "The first training step failed with torch.compile on (%s: %s). This is likely a compile "
+            "failure; retrying the step and training without torch.compile",
+            type(exc).__name__,
+            exc,
+        )
         _disable_torch_compile(policy)
-        optimizer.zero_grad()
-        return update()
+        policy.zero_grad(set_to_none=True)
+        accelerator.step = accumulation_step
+    finally:
+        handle.remove()
+    return update()
 
 
 @contextmanager
@@ -827,9 +862,10 @@ def train(cfg: TrainPipelineConfig) -> None:
     first_step_compiles = False
     if cfg.use_torch_compile:
         if parallel_dims.is_sharded:
-            logging.warning(
-                "--use_torch_compile is not supported with sharded training (FSDP2) yet; training without it"
-            )
+            if is_main_process():
+                logging.warning(
+                    "--use_torch_compile is not supported with sharded training (FSDP2) yet; training without it"
+                )
         else:
             first_step_compiles = _compile_policy_in_place(
                 policy, backend=cfg.torch_compile_backend, mode=cfg.torch_compile_mode
@@ -1015,7 +1051,7 @@ def train(cfg: TrainPipelineConfig) -> None:
         )
         if first_step_compiles:
             # Compilation happens during the first update; fall back to eager if it fails there.
-            train_tracker, _ = _first_update_with_compile_fallback(run_update, policy, optimizer)
+            train_tracker, _ = _first_update_with_compile_fallback(run_update, policy, optimizer, accelerator)
             first_step_compiles = False
         else:
             train_tracker, _ = run_update()

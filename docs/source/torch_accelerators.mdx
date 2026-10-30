@@ -82,8 +82,12 @@ lerobot-train \
     --use_torch_compile=true ...
 ```
 
-- `--torch_compile_backend` (default `inductor`) and `--torch_compile_mode` (default `default`, also `reduce-overhead` or `max-autotune`) are passed to `torch.compile`. These are the same flag names as in `lerobot-rollout`.
+- `--torch_compile_backend` (default `inductor`) and `--torch_compile_mode` (default `default`) are passed to `torch.compile`. These are the same flag names as in `lerobot-rollout`. The modes `reduce-overhead`, `max-autotune` and `max-autotune-no-cudagraphs` apply to the `inductor` backend.
 - The first training steps are slow while the model compiles, so a speedup only shows after the warm-up. Whether you gain anything depends on the policy, the GPU and the batch size: compare `updt_s` in the logs with and without the flag before you keep it on.
+- The model also recompiles later in the run, which makes those steps slow too:
+  - at the end of each epoch, when the last batch is smaller (the dataloader keeps it). After that, the same graph serves every batch size, which can be a little slower. To see this effect, run your comparison past the first epoch (`epch` in the logs);
+  - at the first eval-loss step (`--eval_steps`), which runs without gradients.
 - The model is compiled in place (`nn.Module.compile`), so checkpoints are the same as without compile. A checkpoint trained with compile loads in `lerobot-rollout` and `lerobot-eval` as usual, and you can resume a run with the flag on or off.
-- If `torch.compile` is not available or compilation fails (for example, no Triton or C compiler is installed), training logs a warning and continues without compile.
-- It is not applied to sharded (FSDP2) training yet.
+- If `torch.compile` is not available, cannot be set up, or fails during the **first** training step (for example, no Triton or C compiler is installed), training logs a warning and continues without compile. A compile failure later in the run (at one of the recompiles above) stops training with an error; restart or resume without the flag.
+- With `inductor`, the losses are not bit-identical to a run without compile, because dropout draws different random numbers. Only the random draws differ.
+- It is not applied to sharded (FSDP2) training yet. `--accelerator.compile.*` is a separate placeholder for that future sharded path and does not affect this flag.
