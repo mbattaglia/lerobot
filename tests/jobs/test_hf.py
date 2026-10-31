@@ -321,6 +321,30 @@ def test_build_remote_config_includes_checkpoint_flag_when_enabled(tmp_path):
     assert "job" not in data
 
 
+def test_build_remote_config_omits_torch_compile_fields_by_default(tmp_path):
+    dest = tmp_path / "train_config.json"
+    build_remote_config_file(_minimal_cfg(), "u/run", dest)
+    data = json.loads(dest.read_text())
+    # compile is off → omitted so older images accept the config.
+    for key in ("use_torch_compile", "torch_compile_backend", "torch_compile_mode"):
+        assert key not in data
+    # The pod decodes the missing keys back to the defaults.
+    assert draccus.decode(TrainPipelineConfig, data).use_torch_compile is False
+
+
+def test_build_remote_config_includes_torch_compile_fields_when_enabled(tmp_path):
+    cfg = _minimal_cfg()
+    cfg.use_torch_compile = True
+    cfg.torch_compile_mode = "max-autotune"
+    dest = tmp_path / "train_config.json"
+    build_remote_config_file(cfg, "u/run", dest)
+    data = json.loads(dest.read_text())
+    # explicitly enabled → kept in the config (requires a matching trainer image).
+    assert data["use_torch_compile"] is True
+    assert data["torch_compile_backend"] == "inductor"
+    assert data["torch_compile_mode"] == "max-autotune"
+
+
 def test_build_remote_config_merges_tags_into_policy(tmp_path):
     cfg = _minimal_cfg()
     dest = tmp_path / "train_config.json"

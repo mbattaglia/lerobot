@@ -70,3 +70,26 @@ lerobot-train \
     --accelerator.grad_scaler.init_scale=1024 \
     --accelerator.grad_scaler.growth_interval=2000 ...
 ```
+
+## torch.compile
+
+`lerobot-train` can compile the policy with `torch.compile`. It is off by default; turn it on with `--use_torch_compile=true`:
+
+```bash
+lerobot-train \
+    --policy.type=act \
+    --policy.device=cuda \
+    --use_torch_compile=true ...
+```
+
+- `--torch_compile_backend` (default `inductor`) and `--torch_compile_mode` (default `default`) are passed to `torch.compile`. These are the same flag names as in `lerobot-rollout`. The modes `reduce-overhead`, `max-autotune` and `max-autotune-no-cudagraphs` apply to the `inductor` backend.
+- The first training steps are slow while the model compiles, so a speedup only shows after the warm-up. Whether you gain anything depends on the policy, the GPU and the batch size: compare `updt_s` in the logs with and without the flag before you keep it on.
+- The model is compiled with static shapes (`dynamic=False`). Each new batch size gets its own graph, and the usual batch size keeps its own graph:
+  - At the end of the first epoch, the smaller last batch (the dataloader keeps it) compiles once more, so that step is slow. Later epochs reuse that graph.
+  - The first eval-loss step (`--eval_steps`) also compiles once more, because it runs without gradients.
+- With static shapes, code that runs after a `.item()` call is compiled for each new Python value it sees. For ACT this is the small loss computation at the end of `forward`. It recompiles on each of the first steps until torch reaches its recompile limit (8), then torch logs a `torch._dynamo hit config.recompile_limit` warning and runs that part without compile. This is expected and costs little: the model itself stays compiled.
+- The model is compiled in place (`nn.Module.compile`), so checkpoints are the same as without compile. A checkpoint trained with compile loads in `lerobot-rollout` and `lerobot-eval` as usual, and you can resume a run with the flag on or off.
+- If `torch.compile` is not available, cannot be set up, or fails to compile during the **first** training step (for example, no Triton or C compiler is installed), training logs a warning and continues without compile. Other errors in that step, such as CUDA out-of-memory, stop training as usual. A compile failure later in the run (at one of the recompiles above) also stops training with an error; restart or resume without the flag.
+- On PyTorch 2.10 and newer, the first step also compiles the backward pass during the forward pass, so the fallback works in multi-GPU (DDP) runs too. On older PyTorch versions, a compile failure in the backward pass of a multi-GPU run may not recover.
+- With `inductor`, the losses are not bit-identical to a run without compile, because dropout draws different random numbers. Only the random draws differ.
+- It is not applied to sharded (FSDP2) training yet. `--accelerator.compile.*` is a separate placeholder for that future sharded path and does not affect this flag.

@@ -32,8 +32,9 @@ import dataclasses
 import logging
 import sys
 import time
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import AbstractContextManager, contextmanager, nullcontext
+from functools import partial
 from pprint import pformat
 from typing import TYPE_CHECKING, Any
 
@@ -110,7 +111,7 @@ else:
     PeftModel = None
 
 if TYPE_CHECKING or _accelerate_available:
-    from accelerate.utils import send_to_device
+    from accelerate.utils import is_compiled_module, send_to_device
 
 from .lerobot_eval import eval_policy_all
 
@@ -134,6 +135,122 @@ def _ema_weights(ema: Any, policy: PreTrainedPolicy) -> Iterator[None]:
         yield
     finally:
         ema.restore(params)
+
+
+def _compile_policy_in_place(policy: torch.nn.Module, *, backend: str, mode: str) -> bool:
+    """Compile `policy` in place with `nn.Module.compile` and report whether it was configured.
+
+    In-place compilation only routes `policy(...)` through a compiled `__call__`; the module tree
+    is unchanged, so state_dict keys carry no `_orig_mod.` prefix and checkpoints load the same
+    with or without compile. ``torch.compile`` compiles lazily on the first invocation, so success
+    here does not guarantee that backend compilation will succeed during the first step (see
+    `_first_update_with_compile_fallback`).
+    """
+    if not hasattr(torch, "compile") or not hasattr(policy, "compile"):
+        if is_main_process():
+            logging.warning("torch.compile is not available in this PyTorch build; training without it")
+        return False
+
+    if is_compiled_module(policy) or policy._compiled_call_impl is not None:
+        # e.g. accelerate's own dynamo plugin (ACCELERATE_DYNAMO_BACKEND) already compiled it.
+        if is_main_process():
+            logging.warning("The policy is already compiled; --use_torch_compile does not compile it again")
+        return False
+
+    try:
+        # Static shapes: the smaller last batch of an epoch (drop_last=False) gets its own graph
+        # instead of switching every later batch to a dynamic-shape graph.
+        policy.compile(backend=backend, mode=mode, dynamic=False)
+    except Exception as exc:
+        if is_main_process():
+            logging.warning("Failed to configure torch.compile, training without it: %s", exc)
+        return False
+
+    if is_main_process():
+        logging.info(f"torch.compile configured for the policy ({backend=}, {mode=})")
+    return True
+
+
+def _disable_torch_compile(policy: torch.nn.Module) -> None:
+    """Undo `nn.Module.compile`: `__call__` goes back to the eager forward."""
+    policy._compiled_call_impl = None
+
+
+# Compiles backward graphs during the forward. Only in torch >= 2.10; older versions lower them
+# lazily, during the backward.
+_NON_LAZY_BACKWARD_LOWERING = "force_non_lazy_backward_lowering"
+
+
+def _lower_backward_during_forward() -> AbstractContextManager[Any]:
+    """Make a backward compile failure surface during the forward, where torch supports it."""
+    functorch_config = torch._functorch.config
+    if hasattr(functorch_config, _NON_LAZY_BACKWARD_LOWERING):
+        return functorch_config.patch(**{_NON_LAZY_BACKWARD_LOWERING: True})
+    return nullcontext()
+
+
+def _compile_error_types() -> tuple[type[Exception], ...]:
+    """Exceptions that mean torch.compile itself failed: Dynamo, the backend or Inductor."""
+    errors: list[type[Exception]] = [
+        torch._dynamo.exc.BackendCompilerFailed,
+        torch._dynamo.exc.Unsupported,
+        torch._dynamo.exc.InternalTorchDynamoError,
+    ]
+    # Inductor wraps its own failures (no C compiler, Triton, lowering) in InductorError, also when
+    # it compiles a backward graph lazily. Looked up by name: not every torch 2.x defines it.
+    inductor_error = getattr(torch._inductor.exc, "InductorError", None)
+    if inductor_error is not None:
+        errors.append(inductor_error)
+    return tuple(errors)
+
+
+def _first_update_with_compile_fallback(
+    update: Callable[[], tuple[MetricsTracker, dict | None]],
+    policy: torch.nn.Module,
+    optimizer: Optimizer,
+    accelerator: "Accelerator",
+) -> tuple[MetricsTracker, dict | None]:
+    """Run the first update of a compiled policy, retrying it eagerly if compilation fails.
+
+    The graphs are built during this first update, so this is where a missing Triton or C
+    compiler, or an unsupported op, surfaces. Only compile errors (`_compile_error_types`) are
+    retried; any other error, such as CUDA out-of-memory, is re-raised unchanged. Retrying the
+    same batch eagerly is safe because:
+
+    - On torch >= 2.10 the backward graphs are lowered during the forward, so a backend failure
+      surfaces before DDP's reducer starts all-reducing gradient buckets. Older versions lower
+      them during the backward, where a failure under DDP may not be recoverable.
+    - The retry only happens while the optimizer has not stepped. Up to that point a failed attempt
+      leaves at most partial gradients, cleared on the model itself (accelerate's `zero_grad()` is
+      a no-op on non-sync micro-batches), and one tick of accelerate's gradient-accumulation
+      counter, which is rolled back.
+    """
+    stepped = False
+
+    def mark_stepped(*_: Any) -> None:
+        nonlocal stepped
+        stepped = True
+
+    with _lower_backward_during_forward():
+        handle = getattr(optimizer, "optimizer", optimizer).register_step_pre_hook(mark_stepped)
+        accumulation_step = accelerator.step
+        try:
+            return update()
+        except _compile_error_types() as exc:
+            if stepped:
+                raise
+            logging.warning(
+                "torch.compile failed during the first training step (%s: %s); retrying the step "
+                "and training without torch.compile",
+                type(exc).__name__,
+                exc,
+            )
+            _disable_torch_compile(policy)
+            policy.zero_grad(set_to_none=True)
+            accelerator.step = accumulation_step
+        finally:
+            handle.remove()
+    return update()
 
 
 @contextmanager
@@ -767,6 +884,26 @@ def train(cfg: TrainPipelineConfig) -> None:
     if cfg.resume:
         resume_after_prepare(cfg, accelerator, policy, optimizer, lr_scheduler)
 
+    # --- optional torch.compile -----------------------------------------------------------------
+    # Applied last, to the prepared model: the same point where accelerate puts its own compile.
+    # By then the weights are on the device and resumed, the AMP autocast is patched into
+    # `forward` (so it is traced into the graph), and a DDP wrapper is compiled as a whole, which
+    # is torch's recommended order. The GradScaler acts on the loss and optimizer, outside the
+    # compiled region. The compile is in place, so unwrap_model() and checkpoints are unchanged.
+    first_step_compiles = False
+    if cfg.use_torch_compile:
+        if parallel_dims.is_sharded:
+            if is_main_process():
+                logging.warning(
+                    "--use_torch_compile is not supported with sharded training (FSDP2) yet; training without it"
+                )
+        else:
+            first_step_compiles = _compile_policy_in_place(
+                policy, backend=cfg.torch_compile_backend, mode=cfg.torch_compile_mode
+            )
+            if first_step_compiles and is_main_process():
+                logging.info("The first training steps are slow while the model compiles")
+
     # --- auxiliaries (after the core assembly, per the construction-order contract) -------------
     sample_weighter = None
     if cfg.sample_weighting is not None:
@@ -932,7 +1069,8 @@ def train(cfg: TrainPipelineConfig) -> None:
         batch = _preprocess_dataset_batch(batch, dataset.meta.camera_keys, cfg.rename_map, preprocessor)
         train_tracker.preprocessing_s = time.perf_counter() - preprocessing_start
 
-        train_tracker, _ = update_policy(
+        run_update = partial(
+            update_policy,
             train_tracker,
             policy,
             batch,
@@ -942,6 +1080,12 @@ def train(cfg: TrainPipelineConfig) -> None:
             lr_scheduler=lr_scheduler,
             sample_weighter=sample_weighter,
         )
+        if first_step_compiles:
+            # Compilation happens during the first update; fall back to eager if it fails there.
+            train_tracker, _ = _first_update_with_compile_fallback(run_update, policy, optimizer, accelerator)
+            first_step_compiles = False
+        else:
+            train_tracker, _ = run_update()
         train_tracker.step_s = time.perf_counter() - step_start
 
         # Pull one optimizer step of the live weights into the EMA shadow (main process only).
