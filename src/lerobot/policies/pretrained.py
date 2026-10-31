@@ -151,7 +151,15 @@ class PreTrainedPolicy(nn.Module, HubMixin, abc.ABC):
             # gate prevents N ranks racing on the same files. Single process: never taken.
             return
         self.config._save_pretrained(save_directory)
-        save_torch_state_dict(state_dict, str(save_directory), max_shard_size=_SINGLE_FILE_SHARD_SIZE)
+        # safetensors only stores contiguous tensors, and weights trained in another memory format
+        # (e.g. `--use_channels_last`) are not contiguous in the default layout. `force_contiguous`
+        # writes standard-layout copies with the same values, so the file is the same either way.
+        save_torch_state_dict(
+            state_dict,
+            str(save_directory),
+            max_shard_size=_SINGLE_FILE_SHARD_SIZE,
+            force_contiguous=True,
+        )
 
     @classmethod
     def from_pretrained(

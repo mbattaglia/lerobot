@@ -93,3 +93,32 @@ lerobot-train \
 - On PyTorch 2.10 and newer, the first step also compiles the backward pass during the forward pass, so the fallback works in multi-GPU (DDP) runs too. On older PyTorch versions, a compile failure in the backward pass of a multi-GPU run may not recover.
 - With `inductor`, the losses are not bit-identical to a run without compile, because dropout draws different random numbers. Only the random draws differ.
 - It is not applied to sharded (FSDP2) training yet. `--accelerator.compile.*` is a separate placeholder for that future sharded path and does not affect this flag.
+
+## TF32 and channels_last
+
+Two more optional speed-ups for training on NVIDIA GPUs. Both are off by default. They do not change the checkpoint format. Like `torch.compile`, the gain depends on your policy, GPU and batch size, so **measure it**: compare `updt_s` in the logs (after the first steps) with and without the flag before you keep it on.
+
+```bash
+lerobot-train \
+    --policy.type=act \
+    --policy.device=cuda \
+    --policy.use_amp=true \
+    --use_tf32=true \
+    --use_channels_last=true ...
+```
+
+### `--use_tf32`
+
+- At the start of training it sets `torch.backends.cuda.matmul.allow_tf32 = True`, `torch.backends.cudnn.allow_tf32 = True` and `torch.set_float32_matmul_precision("high")`, and logs the result. TF32 is a faster float32 mode of the tensor cores on Ampere (RTX 30xx, A100) and newer GPUs. It keeps the float32 range but rounds to fewer digits.
+- It only applies to CUDA. On other devices it logs that it does nothing.
+- Expect a small gain, or none:
+  - `lerobot-train` already turns on TF32 for matmuls (`torch.backends.cuda.matmul.allow_tf32 = True`) in every run, and PyTorch already allows TF32 for cuDNN convolutions by default. The flag makes this explicit and logged, and keeps it on if those defaults change.
+  - With `--policy.use_amp=true`, most matmuls and convolutions already run in float16. TF32 only affects the operations that stay in float32.
+
+### `--use_channels_last`
+
+- It converts every 2D conv layer of the policy to the `torch.channels_last` memory format. For ACT, that is the ResNet image backbone (and the 1x1 conv after it). A forward pre-hook on each conv layer also gives it its image input in `channels_last`. Only the memory layout changes, not the values, so the model computes the same thing (up to float rounding).
+- It helps most with `--policy.use_amp=true`: the float16 conv kernels of the tensor cores work in `channels_last`. Without it, cuDNN may have to reorder the data around each conv.
+- It works with AMP and with `--use_torch_compile=true`. The conversion happens before the model is compiled. With the `inductor` backend, torch may already choose `channels_last` for convs by itself, so the gain on top of compile can be small.
+- Checkpoints are saved in the standard layout, with the same values. They load as usual in `lerobot-rollout` and `lerobot-eval`, which do not need the flag. You can resume a run with the flag on or off.
+- If the policy has no 2D conv layers, it logs that it does nothing. It is tested with ACT. It is not applied to sharded (FSDP2) training yet.

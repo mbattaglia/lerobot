@@ -345,6 +345,29 @@ def test_build_remote_config_includes_torch_compile_fields_when_enabled(tmp_path
     assert data["torch_compile_mode"] == "max-autotune"
 
 
+def test_build_remote_config_omits_tf32_and_channels_last_by_default(tmp_path):
+    dest = tmp_path / "train_config.json"
+    build_remote_config_file(_minimal_cfg(), "u/run", dest)
+    data = json.loads(dest.read_text())
+    # off → omitted so older images accept the config.
+    assert "use_tf32" not in data
+    assert "use_channels_last" not in data
+    decoded = draccus.decode(TrainPipelineConfig, data)
+    assert decoded.use_tf32 is False
+    assert decoded.use_channels_last is False
+
+
+def test_build_remote_config_includes_tf32_and_channels_last_when_enabled(tmp_path):
+    cfg = _minimal_cfg()
+    cfg.use_tf32 = True
+    cfg.use_channels_last = True
+    dest = tmp_path / "train_config.json"
+    build_remote_config_file(cfg, "u/run", dest)
+    data = json.loads(dest.read_text())
+    assert data["use_tf32"] is True
+    assert data["use_channels_last"] is True
+
+
 def test_build_remote_config_merges_tags_into_policy(tmp_path):
     cfg = _minimal_cfg()
     dest = tmp_path / "train_config.json"

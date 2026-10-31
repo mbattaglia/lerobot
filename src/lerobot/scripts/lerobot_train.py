@@ -125,6 +125,74 @@ def _ema_parameters(policy: PreTrainedPolicy) -> list[torch.nn.Parameter]:
     return list(policy.parameters())
 
 
+def _enable_tf32(device: torch.device) -> None:
+    """`--use_tf32`: allow TF32 math for float32 matmuls and cuDNN convolutions on CUDA."""
+    if device.type != "cuda":
+        if is_main_process():
+            logging.info(f"--use_tf32 only applies to CUDA; it does nothing on device '{device.type}'")
+        return
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+    torch.set_float32_matmul_precision("high")
+    if is_main_process():
+        logging.info(
+            "TF32 enabled: torch.backends.cuda.matmul.allow_tf32=%s, torch.backends.cudnn.allow_tf32=%s, "
+            "float32_matmul_precision=%s",
+            torch.backends.cuda.matmul.allow_tf32,
+            torch.backends.cudnn.allow_tf32,
+            torch.get_float32_matmul_precision(),
+        )
+
+
+def _channels_last_input(module: torch.nn.Module, args: tuple[Any, ...]) -> tuple[Any, ...] | None:
+    """Forward pre-hook: hand a 4D (N, C, H, W) input to the conv layer in channels_last.
+
+    A no-op for an input that is already channels_last, such as the output of the previous conv.
+    """
+    if args and isinstance(args[0], torch.Tensor) and args[0].dim() == 4:
+        return (args[0].contiguous(memory_format=torch.channels_last), *args[1:])
+    return None
+
+
+def _convert_to_channels_last(policy: torch.nn.Module) -> int:
+    """`--use_channels_last`: move every 2D conv layer of `policy` and its input to channels_last.
+
+    Only the conv weights change layout (their values do not), so the state_dict keys and values
+    stay the same; `PreTrainedPolicy` and the optimizer save them in the standard layout. The
+    input is converted by a forward pre-hook on each conv layer, so it covers every path that
+    reaches a conv (train and eval-loss steps), whatever the policy does to the images before
+    its backbone. Returns the number of conv layers converted.
+    """
+    convs = [module for module in policy.modules() if isinstance(module, torch.nn.Conv2d)]
+    for conv in convs:
+        # In-place for the parameters (`param.data` is replaced), so references stay valid.
+        conv.to(memory_format=torch.channels_last)
+        conv.register_forward_pre_hook(_channels_last_input)
+    return len(convs)
+
+
+def _match_optimizer_state_memory_format(optimizer: Optimizer | dict[str, Optimizer]) -> None:
+    """Give resumed optimizer state the memory format of its channels_last parameter.
+
+    The state is saved in the standard layout, so after a resume it would not match the
+    channels_last weights and gradients. That is still correct, but it makes the multi-tensor
+    optimizer step take a slower path, so the state is converted here (same values).
+    """
+    optimizers: list[Optimizer] = list(optimizer.values()) if isinstance(optimizer, dict) else [optimizer]
+    for opt in optimizers:
+        inner: Optimizer = getattr(opt, "optimizer", opt)  # accelerate's AcceleratedOptimizer wraps it
+        for group in inner.param_groups:
+            for param in group["params"]:
+                if param.dim() != 4 or not param.is_contiguous(memory_format=torch.channels_last):
+                    continue
+                state = inner.state.get(param)
+                if not state:
+                    continue
+                for key, value in state.items():
+                    if isinstance(value, torch.Tensor) and value.shape == param.shape:
+                        state[key] = value.contiguous(memory_format=torch.channels_last)
+
+
 @contextmanager
 def _ema_weights(ema: Any, policy: PreTrainedPolicy) -> Iterator[None]:
     """Temporarily swap the EMA shadow weights into `policy`, restoring the live ones on exit."""
@@ -714,6 +782,8 @@ def train(cfg: TrainPipelineConfig) -> None:
     else:
         torch.backends.cudnn.benchmark = True
     torch.backends.cuda.matmul.allow_tf32 = True
+    if cfg.use_tf32:
+        _enable_tf32(device)
 
     # --- data (the main process downloads once; peers read the populated cache) ----------------
     if is_main_process():
@@ -775,6 +845,25 @@ def train(cfg: TrainPipelineConfig) -> None:
             peft_cli_overrides = dataclasses.asdict(cfg.peft)
             policy = policy.wrap_with_peft(peft_cli_overrides=peft_cli_overrides)
         peft_model = policy
+
+    # --- optional channels_last -----------------------------------------------------------------
+    # Before the optimizer, prepare() and compile: DDP builds its gradient buckets from the
+    # parameter layout at wrap time, and the compiled graph is traced with the final layout.
+    use_channels_last = cfg.use_channels_last
+    if use_channels_last:
+        if parallel_dims.is_sharded:
+            use_channels_last = False
+            if is_main_process():
+                logging.warning(
+                    "--use_channels_last is not supported with sharded training (FSDP2) yet; training without it"
+                )
+        else:
+            num_convs = _convert_to_channels_last(policy)
+            if is_main_process():
+                if num_convs:
+                    logging.info(f"channels_last memory format enabled for {num_convs} conv layers")
+                else:
+                    logging.info("--use_channels_last does nothing: the policy has no 2D conv layers")
 
     accelerator.wait_for_everyone()
 
@@ -883,6 +972,8 @@ def train(cfg: TrainPipelineConfig) -> None:
     finalize_sharded_policy(policy, parallel_dims)
     if cfg.resume:
         resume_after_prepare(cfg, accelerator, policy, optimizer, lr_scheduler)
+        if use_channels_last:
+            _match_optimizer_state_memory_format(optimizer)
 
     # --- optional torch.compile -----------------------------------------------------------------
     # Applied last, to the prepared model: the same point where accelerate puts its own compile.

@@ -314,7 +314,12 @@ def _save_single_optimizer_state(optimizer: torch.optim.Optimizer, save_dir: Pat
     """Save a single optimizer's state to disk."""
     state = optimizer.state_dict()
     param_groups = state.pop("param_groups")
-    flat_state = flatten_dict(state)
+    # safetensors only stores contiguous tensors. State of parameters in another memory format
+    # (e.g. channels_last conv weights) is written in the standard layout, with the same values.
+    flat_state = {
+        key: value.contiguous() if isinstance(value, torch.Tensor) else value
+        for key, value in flatten_dict(state).items()
+    }
     save_file(flat_state, save_dir / OPTIMIZER_STATE)
     write_json(param_groups, save_dir / OPTIMIZER_PARAM_GROUPS)
 
