@@ -102,10 +102,12 @@ Two more optional speed-ups for training on NVIDIA GPUs. Both are off by default
 lerobot-train \
     --policy.type=act \
     --policy.device=cuda \
-    --policy.use_amp=true \
+    --accelerator.mixed_precision=fp16 \
     --use_tf32=true \
     --use_channels_last=true ...
 ```
+
+Mixed precision is set with `--accelerator.mixed_precision=fp16` (or `bf16`; the default `no` trains in float32). `lerobot-train` does not read `--policy.use_amp`, so that flag does not turn on mixed precision in training.
 
 ### `--use_tf32`
 
@@ -113,12 +115,12 @@ lerobot-train \
 - It only applies to CUDA. On other devices it logs that it does nothing.
 - Expect a small gain, or none:
   - `lerobot-train` already turns on TF32 for matmuls (`torch.backends.cuda.matmul.allow_tf32 = True`) in every run, and PyTorch already allows TF32 for cuDNN convolutions by default. The flag makes this explicit and logged, and keeps it on if those defaults change.
-  - With `--policy.use_amp=true`, most matmuls and convolutions already run in float16. TF32 only affects the operations that stay in float32.
+  - With mixed precision (`--accelerator.mixed_precision=fp16` or `bf16`), most matmuls and convolutions already run in that lower precision. TF32 only affects the operations that stay in float32.
 
 ### `--use_channels_last`
 
 - It converts every 2D conv layer of the policy to the `torch.channels_last` memory format. For ACT, that is the ResNet image backbone (and the 1x1 conv after it). A forward pre-hook on each conv layer also gives it its image input in `channels_last`. Only the memory layout changes, not the values, so the model computes the same thing (up to float rounding).
-- It helps most with `--policy.use_amp=true`: the float16 conv kernels of the tensor cores work in `channels_last`. Without it, cuDNN may have to reorder the data around each conv.
-- It works with AMP and with `--use_torch_compile=true`. The conversion happens before the model is compiled. With the `inductor` backend, torch may already choose `channels_last` for convs by itself, so the gain on top of compile can be small.
+- It helps most with mixed precision (`--accelerator.mixed_precision=fp16` or `bf16`): the float16 and bfloat16 conv kernels of the tensor cores work in `channels_last`. Without `channels_last`, cuDNN may have to reorder the data around each conv. In float32 training the gain is usually smaller.
+- It works with mixed precision and with `--use_torch_compile=true`. The conversion happens before the model is compiled. With the `inductor` backend, torch may already choose `channels_last` for convs by itself, so the gain on top of compile can be small.
 - Checkpoints are saved in the standard layout, with the same values. They load as usual in `lerobot-rollout` and `lerobot-eval`, which do not need the flag. You can resume a run with the flag on or off.
 - If the policy has no 2D conv layers, it logs that it does nothing. It is tested with ACT. It is not applied to sharded (FSDP2) training yet.
