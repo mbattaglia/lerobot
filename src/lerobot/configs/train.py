@@ -136,6 +136,14 @@ class TrainPipelineConfig(HubMixin):
     use_torch_compile: bool = False
     torch_compile_backend: str = "inductor"
     torch_compile_mode: str = "default"
+    # Allow TF32 math on CUDA: sets `torch.backends.cuda.matmul.allow_tf32`,
+    # `torch.backends.cudnn.allow_tf32` and `torch.set_float32_matmul_precision("high")` at the start
+    # of training and logs the result. No effect on other devices. Measure the gain on your setup.
+    use_tf32: bool = False
+    # Use the channels_last memory format for the policy's 2D conv layers (the ResNet image backbone
+    # in ACT) and their image inputs. Applied before torch.compile. Training only: checkpoints are
+    # saved in the standard layout and load as usual without this flag. Measure the gain on your setup.
+    use_channels_last: bool = False
     # Number of workers for the dataloader.
     num_workers: int = 4
     batch_size: int = 8
