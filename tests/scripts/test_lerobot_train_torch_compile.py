@@ -216,6 +216,11 @@ def test_already_compiled_policy_is_not_compiled_again():
 # --- first-step fallback, against a real (CPU) accelerate stack ------------------------------------
 
 
+def _compile_error(message: str) -> Exception:
+    """What Inductor raises when it fails to compile a graph."""
+    return torch._inductor.exc.InductorError(RuntimeError(message), None)
+
+
 class _FailInBackward(torch.autograd.Function):
     """Identity forward; its backward fails like a lazily lowered backward graph would."""
 
@@ -225,7 +230,7 @@ class _FailInBackward(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad):
-        raise RuntimeError("backward lowering failed")
+        raise _compile_error("backward lowering failed")
 
 
 class _TwoLayerPolicy(torch.nn.Module):
@@ -296,7 +301,7 @@ def test_first_step_backward_failure_under_gradient_accumulation_matches_eager(m
 
     with caplog.at_level(logging.WARNING):
         _first_update_with_compile_fallback(lambda: update(batches[0]), policy, optimizer, accelerator)
-    assert "RuntimeError: backward lowering failed" in caplog.text
+    assert "InductorError: RuntimeError: backward lowering failed" in caplog.text
     assert policy._compiled_call_impl is None
     # The first micro-batch must not sync: the update lands after the second, as in eager mode.
     assert not accelerator.sync_gradients
@@ -320,9 +325,27 @@ def test_error_after_the_optimizer_step_is_not_retried(make_accelerator):
     def update():
         calls.append(1)
         update_policy(_tracker(), policy, _batches(1)[0], optimizer, 0.0, accelerator=accelerator)
-        raise RuntimeError("after the step")
+        raise _compile_error("after the step")
 
-    with pytest.raises(RuntimeError, match="after the step"):
+    with pytest.raises(torch._inductor.exc.InductorError, match="after the step"):
+        _first_update_with_compile_fallback(update, policy, optimizer, accelerator)
+    assert calls == [1]
+    assert policy._compiled_call_impl is compiled_call
+
+
+def test_errors_that_are_not_compile_errors_are_reraised_unchanged(make_accelerator):
+    accelerator = make_accelerator(1)
+    policy = _TwoLayerPolicy()
+    optimizer = accelerator.prepare(torch.optim.SGD(policy.parameters(), lr=0.5))
+    compiled_call = policy._call_impl
+    policy._compiled_call_impl = compiled_call
+    calls = []
+
+    def update():
+        calls.append(1)
+        raise torch.OutOfMemoryError("CUDA out of memory")
+
+    with pytest.raises(torch.OutOfMemoryError, match="CUDA out of memory"):
         _first_update_with_compile_fallback(update, policy, optimizer, accelerator)
     assert calls == [1]
     assert policy._compiled_call_impl is compiled_call
@@ -344,6 +367,67 @@ def test_first_step_lowers_the_backward_graph_during_the_forward(make_accelerato
     _first_update_with_compile_fallback(update, policy, optimizer, accelerator)
     assert seen == [True]
     assert functorch_config.force_non_lazy_backward_lowering is False
+
+
+def test_first_step_runs_on_torch_without_non_lazy_backward_lowering(make_accelerator, monkeypatch, caplog):
+    """torch < 2.10 has no `force_non_lazy_backward_lowering`: the update must run compiled as is."""
+    import torch._functorch.config as functorch_config
+
+    missing_key = "force_non_lazy_backward_lowering_missing_before_torch_2_10"
+    assert not hasattr(functorch_config, missing_key)
+    monkeypatch.setattr(lerobot_train, "_NON_LAZY_BACKWARD_LOWERING", missing_key)
+
+    accelerator = make_accelerator(1)
+    policy = _TwoLayerPolicy()
+    optimizer = accelerator.prepare(torch.optim.SGD(policy.parameters(), lr=0.5))
+    compiled_call = policy._call_impl
+    policy._compiled_call_impl = compiled_call
+    calls = []
+
+    def update():
+        calls.append(functorch_config.force_non_lazy_backward_lowering)
+        return update_policy(_tracker(), policy, _batches(1)[0], optimizer, 0.0, accelerator=accelerator)
+
+    with caplog.at_level(logging.WARNING):
+        _first_update_with_compile_fallback(update, policy, optimizer, accelerator)
+    assert calls == [False]
+    assert policy._compiled_call_impl is compiled_call
+    assert "torch.compile failed" not in caplog.text
+
+
+# --- static shapes ---------------------------------------------------------------------------------
+
+SHAPE_RECORDING_BACKEND = "lerobot_test_shape_recording_backend"
+_compiled_graph_inputs: list[list] = []
+
+
+@torch._dynamo.register_backend(name=SHAPE_RECORDING_BACKEND)
+def _shape_recording_backend(gm, example_inputs):
+    # A dynamic-shape graph takes its symbolic sizes as extra SymInt inputs.
+    _compiled_graph_inputs.append(
+        [tuple(t.shape) if isinstance(t, torch.Tensor) else type(t).__name__ for t in example_inputs]
+    )
+    return gm.forward
+
+
+class _Doubler(torch.nn.Module):
+    def forward(self, x):
+        return x * 2 + 1
+
+
+@requires_torch_compile
+def test_compile_uses_static_shapes():
+    """A smaller last batch gets its own graph; later batches do not switch to a dynamic shape."""
+    torch._dynamo.reset()
+    _compiled_graph_inputs.clear()
+    policy = _Doubler()
+    assert _compile_policy_in_place(policy, backend=SHAPE_RECORDING_BACKEND, mode="default")
+    for batch_size in (4, 4, 3, 4, 5):
+        policy(torch.ones(batch_size, 2))
+    # One static graph per batch size; with dynamic shapes the second graph would take a SymInt
+    # and serve every later size.
+    assert _compiled_graph_inputs == [[(4, 2)], [(3, 2)], [(5, 2)]]
+    torch._dynamo.reset()
 
 
 # --- end to end through train() --------------------------------------------------------------------

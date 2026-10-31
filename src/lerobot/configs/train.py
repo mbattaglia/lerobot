@@ -130,8 +130,9 @@ class TrainPipelineConfig(HubMixin):
     cudnn_deterministic: bool = False
     # Compile the policy with torch.compile before training (in place, via `nn.Module.compile`, so
     # checkpoints keep their usual state_dict keys). The first steps are slow while the model
-    # compiles; measure the gain on your setup. If compile is unavailable or fails during the first
-    # step, training logs a warning and continues without it. Same flag names as `lerobot-rollout`.
+    # compiles; measure the gain on your setup. Shapes are static (`dynamic=False`). If compile is
+    # unavailable or fails to compile during the first step, training logs a warning and continues
+    # without it. Same flag names as `lerobot-rollout`.
     use_torch_compile: bool = False
     torch_compile_backend: str = "inductor"
     torch_compile_mode: str = "default"

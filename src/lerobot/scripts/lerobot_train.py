@@ -158,7 +158,9 @@ def _compile_policy_in_place(policy: torch.nn.Module, *, backend: str, mode: str
         return False
 
     try:
-        policy.compile(backend=backend, mode=mode)
+        # Static shapes: the smaller last batch of an epoch (drop_last=False) gets its own graph
+        # instead of switching every later batch to a dynamic-shape graph.
+        policy.compile(backend=backend, mode=mode, dynamic=False)
     except Exception as exc:
         if is_main_process():
             logging.warning("Failed to configure torch.compile, training without it: %s", exc)
@@ -174,25 +176,54 @@ def _disable_torch_compile(policy: torch.nn.Module) -> None:
     policy._compiled_call_impl = None
 
 
+# Compiles backward graphs during the forward. Only in torch >= 2.10; older versions lower them
+# lazily, during the backward.
+_NON_LAZY_BACKWARD_LOWERING = "force_non_lazy_backward_lowering"
+
+
+def _lower_backward_during_forward() -> AbstractContextManager[Any]:
+    """Make a backward compile failure surface during the forward, where torch supports it."""
+    functorch_config = torch._functorch.config
+    if hasattr(functorch_config, _NON_LAZY_BACKWARD_LOWERING):
+        return functorch_config.patch(**{_NON_LAZY_BACKWARD_LOWERING: True})
+    return nullcontext()
+
+
+def _compile_error_types() -> tuple[type[Exception], ...]:
+    """Exceptions that mean torch.compile itself failed: Dynamo, the backend or Inductor."""
+    errors: list[type[Exception]] = [
+        torch._dynamo.exc.BackendCompilerFailed,
+        torch._dynamo.exc.Unsupported,
+        torch._dynamo.exc.InternalTorchDynamoError,
+    ]
+    # Inductor wraps its own failures (no C compiler, Triton, lowering) in InductorError, also when
+    # it compiles a backward graph lazily. Looked up by name: not every torch 2.x defines it.
+    inductor_error = getattr(torch._inductor.exc, "InductorError", None)
+    if inductor_error is not None:
+        errors.append(inductor_error)
+    return tuple(errors)
+
+
 def _first_update_with_compile_fallback(
     update: Callable[[], tuple[MetricsTracker, dict | None]],
     policy: torch.nn.Module,
     optimizer: Optimizer,
     accelerator: "Accelerator",
 ) -> tuple[MetricsTracker, dict | None]:
-    """Run the first update of a compiled policy, retrying it eagerly if it fails.
+    """Run the first update of a compiled policy, retrying it eagerly if compilation fails.
 
     The graphs are built during this first update, so this is where a missing Triton or C
-    compiler, or an unsupported op, surfaces. Retrying the same batch eagerly is safe because:
+    compiler, or an unsupported op, surfaces. Only compile errors (`_compile_error_types`) are
+    retried; any other error, such as CUDA out-of-memory, is re-raised unchanged. Retrying the
+    same batch eagerly is safe because:
 
-    - The backward graphs are lowered during the forward (`force_non_lazy_backward_lowering`), so
-      a backend failure surfaces before DDP's reducer starts all-reducing gradient buckets.
+    - On torch >= 2.10 the backward graphs are lowered during the forward, so a backend failure
+      surfaces before DDP's reducer starts all-reducing gradient buckets. Older versions lower
+      them during the backward, where a failure under DDP may not be recoverable.
     - The retry only happens while the optimizer has not stepped. Up to that point a failed attempt
       leaves at most partial gradients, cleared on the model itself (accelerate's `zero_grad()` is
       a no-op on non-sync micro-batches), and one tick of accelerate's gradient-accumulation
       counter, which is rolled back.
-
-    An error raised after the optimizer stepped is re-raised without a retry.
     """
     stepped = False
 
@@ -200,25 +231,25 @@ def _first_update_with_compile_fallback(
         nonlocal stepped
         stepped = True
 
-    handle = getattr(optimizer, "optimizer", optimizer).register_step_pre_hook(mark_stepped)
-    accumulation_step = accelerator.step
-    try:
-        with torch._functorch.config.patch(force_non_lazy_backward_lowering=True):
+    with _lower_backward_during_forward():
+        handle = getattr(optimizer, "optimizer", optimizer).register_step_pre_hook(mark_stepped)
+        accumulation_step = accelerator.step
+        try:
             return update()
-    except Exception as exc:
-        if stepped:
-            raise
-        logging.warning(
-            "The first training step failed with torch.compile on (%s: %s). This is likely a compile "
-            "failure; retrying the step and training without torch.compile",
-            type(exc).__name__,
-            exc,
-        )
-        _disable_torch_compile(policy)
-        policy.zero_grad(set_to_none=True)
-        accelerator.step = accumulation_step
-    finally:
-        handle.remove()
+        except _compile_error_types() as exc:
+            if stepped:
+                raise
+            logging.warning(
+                "torch.compile failed during the first training step (%s: %s); retrying the step "
+                "and training without torch.compile",
+                type(exc).__name__,
+                exc,
+            )
+            _disable_torch_compile(policy)
+            policy.zero_grad(set_to_none=True)
+            accelerator.step = accumulation_step
+        finally:
+            handle.remove()
     return update()
 
 
